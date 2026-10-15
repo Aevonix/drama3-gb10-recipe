@@ -1,0 +1,81 @@
+From: Kurcide <contact@aevonix.com>
+Subject: [PATCH] Optional online FP8 for the text output head
+
+Quantizes lm_head to FP8 at load time from the bf16 checkpoint, with no
+checkpoint conversion. Off unless DRAMA3_LM_HEAD_FP8=1.
+
+ParallelLMHead is not a LinearBase, so the stock Fp8Config.get_quant_method
+would never select it; hence the explicit branch. Routed experts are
+untouched and keep their serialized block-FP8 config.
+---
+--- a/sglang_omni/models/fishaudio_drama3/quantization.py
++++ b/sglang_omni/models/fishaudio_drama3/quantization.py
+@@ -1,8 +1,9 @@
+ # SPDX-License-Identifier: Apache-2.0
+-"""bsgemm-moe quantization: block-FP8 routed experts, every other layer unquantized."""
++"""bsgemm-moe quantization: block-FP8 experts, optional online-FP8 lm_head."""
+ 
+ from __future__ import annotations
+ 
++import os
+ from collections.abc import Mapping
+ 
+ import torch
+@@ -12,16 +13,18 @@
+     QuantizationConfig,
+     QuantizeMethodBase,
+ )
+-from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
++from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod, Fp8MoEMethod
+ from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
++from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+ 
+ QUANTIZATION_METHOD = "bsgemm-moe"
+ EXPERT_WEIGHT_BLOCK_SIZE = [128, 128]
+ EXPERT_ACTIVATION_SCHEME = "dynamic"
++LM_HEAD_FP8_ENV = "DRAMA3_LM_HEAD_FP8"
+ 
+ 
+ class ExpertFp8Config(QuantizationConfig):
+-    """FusedMoE experts are FP8 ([128, 128] weight blocks, dynamic activations)."""
++    """Block-FP8 experts; DRAMA3_LM_HEAD_FP8=1 opts the lm_head into online FP8."""
+ 
+     def __init__(self) -> None:
+         super().__init__()
+@@ -30,6 +33,17 @@
+             activation_scheme=EXPERT_ACTIVATION_SCHEME,
+             weight_block_size=list(EXPERT_WEIGHT_BLOCK_SIZE),
+         )
++        # Keep the serialized block-FP8 expert config separate from the bf16 head.
++        # Only the literal value "1" enables this, sampled when the config is built.
++        self.lm_head_fp8_config = (
++            Fp8Config(
++                is_checkpoint_fp8_serialized=False,
++                activation_scheme="dynamic",
++                weight_block_size=None,
++            )
++            if os.environ.get(LM_HEAD_FP8_ENV, "0") == "1"
++            else None
++        )
+ 
+     def get_name(self) -> str:
+         return QUANTIZATION_METHOD
+@@ -71,10 +85,16 @@
+     def get_quant_method(
+         self, layer: torch.nn.Module, prefix: str
+     ) -> QuantizeMethodBase | None:
+-        # The interface passes the layer prefix; the choice here depends on the
+-        # layer type alone.
+         if isinstance(layer, FusedMoE):
+             return Fp8MoEMethod(self.expert_fp8_config)
++        elif (
++            self.lm_head_fp8_config is not None
++            and prefix.rsplit(".", 1)[-1] == "lm_head"
++            and isinstance(layer, (LinearBase, ParallelLMHead))
++        ):
++            # ParallelLMHead is not a LinearBase, so Fp8Config.get_quant_method
++            # would not select it. Its logits processor uses this method's apply.
++            return Fp8LinearMethod(self.lm_head_fp8_config)
+         elif isinstance(layer, LinearBase):
+             return UnquantizedLinearMethod()
+         else:

@@ -1,0 +1,47 @@
+From: Kurcide <contact@aevonix.com>
+Subject: [PATCH] Optional online FP8 for the audio-decoder (MTP) projections
+
+The MTP projections are plain nn.Linear, so they have no quant_method and the
+loader's process_weights_after_loading never reaches them. This quantizes
+them after the decoder's own weight loader has run, which is required: that
+loader copies in place into pre-existing bf16 parameters and shards gate/up
+into the two halves of gate_up_proj.
+
+Off unless DRAMA3_MTP_FP8=1. Scope is selectable so the most audio-sensitive
+weights can stay bf16:
+  DRAMA3_MTP_FP8_PROJ       which projections (default: all five)
+  DRAMA3_MTP_FP8_GROUPS     shared_layers and/or residual_layers
+  DRAMA3_MTP_FP8_SKIP_LAST  keep the last N residual layers bf16
+  DRAMA3_MTP_FP8_HEADS      include the codebook heads (default 1)
+
+Per-output-channel scales, dynamic per-token activations. Every target is
+validated before any module is replaced, so a rejected config fails the load
+instead of leaving a half-converted tower.
+
+NOTE: this disables the fused MTP tower by construction, because that path
+requires exactly nn.Linear with bf16 weights. The two are mutually exclusive.
+---
+--- a/sglang_omni/models/fishaudio_drama3/sglang_model.py
++++ b/sglang_omni/models/fishaudio_drama3/sglang_model.py
+@@ -10,6 +10,7 @@
+ from __future__ import annotations
+ 
+ import dataclasses
++import os
+ from collections.abc import Iterable, Iterator
+ 
+ import torch
+@@ -361,3 +362,13 @@
+             pass
+         self.lm_head.weight_loader(self.lm_head.weight, lm_head_weights[0])
+         load_audio_decoder_weights(self.audio_decoder, decoder_weights)
++        if os.environ.get("DRAMA3_MTP_FP8", "0") == "1":
++            # The manual loader needs the original bf16 parameters above.
++            from sglang_omni.models.fishaudio_drama3.mtp_fp8 import (
++                quantize_mtp_after_loading,
++            )
++
++            quantize_mtp_after_loading(
++                self.audio_decoder,
++                include_heads=os.environ.get("DRAMA3_MTP_FP8_HEADS", "1") == "1",
++            )

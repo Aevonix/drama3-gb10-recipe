@@ -1,0 +1,33 @@
+Drama 3 GB10 recipe
+Copyright 2026 Aevonix
+
+Built with Fish Audio.
+
+This repository contains patches, configuration and measurements. It contains no
+model weights and no generated speech.
+
+The model these patches modify the serving of, fishaudio/drama-3, is distributed
+by Fish Audio under the Fish Audio Community License. That license governs your
+use of the model regardless of anything in this repository. Points worth reading
+before you act on this recipe, in the license's own terms and not as legal
+advice:
+
+  - Section II permits Non-Commercial Purposes, "such as personal use (i.e.,
+    hobbyist) or evaluation and testing".
+  - Section III(a) permits commercial use only below USD 500k annual revenue,
+    with a notify-and-transition obligation above it.
+  - Section III(c) grants no Hosted Service right.
+  - Section IV(a) requires displaying "Built with Fish Audio" where the
+    materials, or a product using them, are distributed.
+  - Section IV(b)(i) prohibits generating speech that imitates the voice of an
+    identifiable natural person without that person's prior consent.
+
+On that last point, concretely: confirm whose voice a reference clip is before
+you clone it. Any placeholder or smoke-test reference should be a repository
+example, synthetic, or your own recording, never a third party's voice. The
+Hugging Face license tag reads "fish-audio-research-license" but the LICENSE file
+in the model repository is the Community License and is what governs.
+
+The serving stack, SGLang-Omni, is Apache-2.0 licensed by its authors. The
+patches in patches/ are derivative of files in that project and are offered
+under the same license.

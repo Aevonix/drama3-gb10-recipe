@@ -1,0 +1,171 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Opt-in online FP8 for the loaded Drama 3 audio-decoder projections only."""
+
+from __future__ import annotations
+
+import logging
+import os
+
+import torch
+from sglang.srt.layers.quantization.fp8_utils import (
+    apply_fp8_linear,
+    per_token_group_quant_fp8,
+)
+from torch import nn
+
+logger = logging.getLogger(__name__)
+
+# Explicit allowlist: embeddings, norms, backbone and lm_head never enter here.
+LAYER_PROJECTIONS = (
+    "eh_proj",
+    "self_attn.qkv_proj",
+    "self_attn.o_proj",
+    "mlp.gate_up_proj",
+    "mlp.down_proj",
+)
+
+
+def _selected_projections() -> tuple[str, ...]:
+    """DRAMA3_MTP_FP8_PROJ: comma list of projection names; default all of them.
+
+    Lets the owner keep audio-sensitive projections in bf16, e.g. MLP-only with
+    DRAMA3_MTP_FP8_PROJ=mlp.gate_up_proj,mlp.down_proj.
+    """
+    raw = os.environ.get("DRAMA3_MTP_FP8_PROJ", "").strip()
+    if not raw:
+        return LAYER_PROJECTIONS
+    chosen = tuple(part.strip() for part in raw.split(",") if part.strip())
+    unknown = [name for name in chosen if name not in LAYER_PROJECTIONS]
+    if unknown:
+        raise ValueError(
+            f"Drama 3 MTP FP8: DRAMA3_MTP_FP8_PROJ names unknown projections "
+            f"{unknown}; valid: {list(LAYER_PROJECTIONS)}"
+        )
+    return chosen
+
+
+def _selected_groups() -> tuple[str, ...]:
+    """DRAMA3_MTP_FP8_GROUPS: shared_layers and/or residual_layers; default both."""
+    raw = os.environ.get("DRAMA3_MTP_FP8_GROUPS", "").strip()
+    valid = ("shared_layers", "residual_layers")
+    if not raw:
+        return valid
+    chosen = tuple(part.strip() for part in raw.split(",") if part.strip())
+    unknown = [name for name in chosen if name not in valid]
+    if unknown:
+        raise ValueError(
+            f"Drama 3 MTP FP8: DRAMA3_MTP_FP8_GROUPS names unknown groups "
+            f"{unknown}; valid: {list(valid)}"
+        )
+    return chosen
+
+
+def _skip_last_residual() -> int:
+    """DRAMA3_MTP_FP8_SKIP_LAST: keep the last N residual layers in bf16.
+
+    The late residual layers carry the finest codebook detail, so this is the
+    knob for trading speed back for detail from the end of the tower.
+    """
+    raw = os.environ.get("DRAMA3_MTP_FP8_SKIP_LAST", "0").strip()
+    if not raw.isdigit():
+        raise ValueError(
+            f"Drama 3 MTP FP8: DRAMA3_MTP_FP8_SKIP_LAST must be a non-negative "
+            f"integer; got {raw!r}"
+        )
+    return int(raw)
+
+
+class MtpFp8Linear(nn.Module):
+    """Inference linear: E4M3 weight rows and one float32 scale per output channel.
+
+    Keep weight in [out, in] layout so existing tower geometry inspection works.
+    The SGLang matmul consumes its transpose [in, out] and scales [1, out].
+    No quant_method is attached: the outer loader must not postprocess it again.
+    """
+
+    def __init__(self, linear: nn.Linear) -> None:
+        super().__init__()
+        self.in_features = linear.in_features
+        self.out_features = linear.out_features
+        self.register_parameter("bias", None)
+        # One whole-row group is one scale per output channel, as in SGLang's
+        # online Fp8LinearMethod. Quantize only after gate/up and QKV loading.
+        with torch.no_grad():
+            weight, scale = per_token_group_quant_fp8(
+                linear.weight.detach(), linear.in_features
+            )
+        self.weight = nn.Parameter(weight, requires_grad=False)
+        self.register_buffer("weight_scale", scale.t().contiguous())
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return apply_fp8_linear(
+            input=inputs.contiguous(),
+            weight=self.weight.t(),
+            weight_scale=self.weight_scale,
+            input_scale=None,
+            bias=None,
+            use_per_token_if_dynamic=True,
+        )
+
+
+def quantize_mtp_after_loading(decoder: nn.Module, *, include_heads: bool) -> None:
+    """Replace only the allowlisted, fully loaded bf16 linears; fail load on error.
+
+    Called once by Drama3ForCausalLM.load_weights, before graph/fusion setup.
+    Conversion is sequential; no collection of old bf16 weights is retained.
+    """
+    projections = _selected_projections()
+    groups = _selected_groups()
+    skip_last = _skip_last_residual()
+    targets: list[tuple[nn.Module, str, str]] = []
+    for group in groups:
+        layers = list(getattr(decoder, group))
+        if group == "residual_layers" and skip_last:
+            # Keep the last N residual layers (finest detail) in bf16.
+            layers = layers[: max(0, len(layers) - skip_last)]
+        for index, layer in enumerate(layers):
+            for path in projections:
+                parent_path, _, name = path.rpartition(".")
+                parent = layer.get_submodule(parent_path) if parent_path else layer
+                targets.append((parent, name, f"{group}.{index}.{path}"))
+    if include_heads:
+        for index in range(len(decoder.codebook_heads)):
+            targets.append((decoder.codebook_heads, str(index), f"codebook_heads.{index}"))
+
+    # Check the complete selection before mutating any module. A second load
+    # into an already quantized decoder is unsupported; construct a fresh model.
+    for parent, name, path in targets:
+        linear = getattr(parent, name)
+        if type(linear) is not nn.Linear or linear.bias is not None:
+            raise ValueError(f"Drama 3 MTP FP8: {path} needs a bias-free torch Linear")
+        weight = linear.weight
+        if (
+            weight.dtype != torch.bfloat16
+            or weight.device.type != "cuda"
+            or not weight.is_contiguous()
+            or tuple(weight.shape) != (linear.out_features, linear.in_features)
+            or linear.in_features % 16 != 0
+            or linear.out_features % 16 != 0
+        ):
+            raise ValueError(
+                f"Drama 3 MTP FP8: {path} needs a contiguous CUDA bfloat16 weight "
+                f"[out, in] with dimensions divisible by 16; got "
+                f"{tuple(weight.shape)} {weight.dtype} on {weight.device}"
+            )
+
+    for parent, name, path in targets:
+        try:
+            setattr(parent, name, MtpFp8Linear(getattr(parent, name)))
+        except Exception as error:
+            # Never continue with a silently partial conversion.
+            raise RuntimeError(f"Drama 3 MTP FP8: conversion failed at {path}") from error
+    logger.info(
+        "Drama 3 MTP FP8: converted %d layer projections and %d codebook heads; "
+        "per-channel weights, dynamic per-token activations",
+        sum(1 for _, _, path in targets if not path.startswith("codebook_heads")),
+        sum(1 for _, _, path in targets if path.startswith("codebook_heads")),
+    )
+    logger.info(
+        "Drama 3 MTP FP8 scope: groups=%s projections=%s skip_last_residual=%d",
+        ",".join(groups), ",".join(projections), skip_last,
+    )

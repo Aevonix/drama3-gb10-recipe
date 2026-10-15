@@ -1,0 +1,67 @@
+<!-- The PNG beside this file was rendered with Geist and Geist Mono (SIL OFL 1.1)
+     installed locally. The font files are not redistributed here; install them, or
+     let the system fallbacks below take over, and the layout still holds. -->
+<!doctype html><html><head><meta charset="utf-8"><title>Drama 3 GB10 Card</title><style>
+:root { --g:#151615; --c:#F3E5CD; --q:#C0B4A0; --a:#EEB07E; --t:#A9D5CE; --co:#D99288; --ok:#5FD38A;
+  --rule: rgba(243,229,205,.14); --panel: rgba(243,229,205,.035); }
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { width: 1200px; height: 675px; overflow: hidden; background: transparent; }
+body { color: var(--c); font-family: "Geist", sans-serif; }
+.card { width: 1200px; height: 675px; background: var(--g); border-radius: 24px; padding: 40px 60px 0; display: flex; flex-direction: column; }
+.top { display: flex; justify-content: space-between; align-items: center; }
+.top img { width: 260px; display: block; margin: 4px 0; }
+.tag { font-family: "Geist Mono", monospace; font-size: 15px; letter-spacing: .2em; color: var(--a); text-transform: uppercase; text-align: right; line-height: 1.7; }
+.tag span { color: var(--q); }
+.main { flex: 1; display: flex; gap: 44px; align-items: center; min-height: 0; padding-bottom: 6px; }
+.left { width: 500px; display: flex; flex-direction: column; }
+h1 { font-size: 54px; line-height: 1.04; letter-spacing: -0.03em; font-weight: 800; }
+h1 em { font-style: normal; color: var(--a); }
+.lede { color: var(--q); font-size: 21px; margin-top: 14px; }
+.lede b { color: var(--c); font-weight: 600; }
+ul { list-style: none; margin-top: 34px; }
+li { display: flex; gap: 12px; font-size: 17.5px; line-height: 1.62; color: var(--c); }
+li::before { content: ""; flex: none; width: 8px; height: 8px; border-radius: 2px; background: var(--t); margin-top: 11px; }
+li .m { font-family: "Geist Mono", monospace; font-size: 15.5px; color: var(--q); }
+.right { flex: 1; display: flex; flex-direction: column; }
+.panel { background: var(--panel); border: 1px solid var(--rule); border-radius: 14px; padding: 16px 22px 8px; }
+.cap { font-family: "Geist Mono", monospace; font-size: 12px; letter-spacing: .16em; text-transform: uppercase; color: var(--q); margin-bottom: 4px; }
+.row { display: grid; grid-template-columns: 1fr auto; align-items: baseline; padding: 11px 0; border-top: 1px solid var(--rule); }
+.cap + .row { border-top: none; }
+.k { font-size: 17px; color: var(--c); font-weight: 600; }
+.k small { display: block; font-weight: 400; font-size: 13.5px; color: var(--q); margin-top: 2px; }
+.v { font-family: "Geist Mono", monospace; font-size: 17px; color: var(--q); text-align: right; white-space: nowrap; }
+.v b { font-size: 30px; font-weight: 700; color: var(--ok); letter-spacing: -0.02em; }
+.v .d { display: block; font-size: 13px; color: var(--ok); margin-top: 2px; }
+.cmd { margin-top: 14px; display: flex; justify-content: space-between; align-items: center; background: var(--panel); border: 1px solid var(--rule); border-radius: 14px; padding: 13px 22px; }
+.cmd .k { font-weight: 600; }
+.cmd code { font-family: "Geist Mono", monospace; font-size: 19px; color: var(--a); }
+.cmd code span { color: var(--q); }
+footer { border-top: 1px solid var(--rule); padding: 15px 0 20px; display: flex; justify-content: space-between; font-size: 16px; color: var(--q); }
+footer b { color: var(--c); font-weight: 600; }
+footer .url { font-family: "Geist Mono", monospace; font-size: 15px; color: var(--c); }
+</style></head><body><div class="card">
+  <div class="top"><img src="aevonix-primary-dark.svg" alt="Aevonix Research"><div class="tag">Open recipe<br><span>DGX Spark · GB10</span></div></div>
+  <div class="main">
+    <div class="left">
+      <h1>Fish Audio Drama 3<br>on <em>one DGX Spark.</em></h1>
+      <div class="lede">Open recipe, <b>single command.</b></div>
+      <ul>
+        <li><span>Runs on aarch64 / <span class="m">sm_121</span></span></li>
+        <li><span>conda-forge path past the pynini wall</span></li>
+        <li><span>CUDA graphs + stream stride 4</span></li>
+        <li><span>FP8 output head, residual-only FP8 MTP</span></li>
+        <li><span>Online FP8 backbone: attention, experts, linear attention</span></li>
+      </ul>
+    </div>
+    <div class="right">
+      <div class="panel">
+        <div class="cap">Single GB10 · engine only</div>
+        <div class="row"><div class="k">Time to first audio<small>short line</small></div><div class="v">0.81 s → <b>0.36 s</b></div></div>
+        <div class="row"><div class="k">Decode<small>tokens per second</small></div><div class="v">23.9 → <b>38.9</b><span class="d">↑ about 1.6× stock</span></div></div>
+        <div class="row"><div class="k">Real-time factor<small>long line, lower is faster</small></div><div class="v">0.94 → <b>0.58</b><span class="d">↓ faster than real time</span></div></div>
+      </div>
+      <div class="cmd"><span class="k">One-command start</span><code><span>$</span> ./run.sh</code></div>
+    </div>
+  </div>
+  <footer><span>Aevonix Research · Built with <b>Fish Audio</b></span><span class="url">github.com/Aevonix/drama3-gb10-recipe</span></footer>
+</div></body></html>

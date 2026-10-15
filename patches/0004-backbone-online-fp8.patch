@@ -1,0 +1,235 @@
+From: Kurcide <contact@aevonix.com>
+Subject: [PATCH] Optional online FP8 for attention, shared experts and linear attention
+
+Converts selected backbone linear layers to FP8 at load time from the bf16
+checkpoint, with no checkpoint conversion and no extra files. Off unless
+DRAMA3_BACKBONE_FP8=1, and the selection is DRAMA3_BACKBONE_FP8_SCOPE, a comma
+list of attention, shared_experts and linear_attn.
+
+The routed experts are already block-FP8 in the shipped checkpoint, so most of
+the model's weight mass is FP8 before this patch does anything. What is left in
+bf16 is the backbone, and converting it buys decode throughput rather than
+memory: measured on one GB10, decode goes 28.58 -> 38.85 tok/s and TTFB 0.42 ->
+0.36 s, for 1.309 GiB of weights saved and a load-time peak that RISES, because
+the conversion happens after the bf16 weights are resident.
+
+Two things worth knowing before changing the scope table.
+
+The suffixes are RUNTIME module names, not checkpoint tensor names. The two
+differ wherever upstream fuses projections, so a scope written from checkpoint
+names selects nothing, serves perfectly, and reads as a result. The conversion
+summary is logged for exactly that reason: check the module counts before
+believing a measurement.
+
+Three things are excluded on purpose and cannot be selected by any scope: the
+MoE router and the shared-expert gate, because a small logit shift changes which
+experts run at all; the linear-attention in_proj_ba, because it produces decay
+and gating terms rather than a value path and so carries the precision risk of
+the whole family for 0.4% of its bytes; and the linear-attention conv1d, which
+upstream builds with quant_config=None so this config is never consulted for it.
+---
+--- a/sglang_omni/models/fishaudio_drama3/quantization.py
++++ b/sglang_omni/models/fishaudio_drama3/quantization.py
+@@ -1,8 +1,9 @@
+ # SPDX-License-Identifier: Apache-2.0
+-"""bsgemm-moe quantization: block-FP8 experts, optional online-FP8 lm_head."""
++"""Block-FP8 experts, optional online-FP8 lm_head and backbone linears."""
+ 
+ from __future__ import annotations
+ 
++import logging
+ import os
+ from collections.abc import Mapping
+ 
+@@ -21,12 +22,151 @@
+ EXPERT_WEIGHT_BLOCK_SIZE = [128, 128]
+ EXPERT_ACTIVATION_SCHEME = "dynamic"
+ LM_HEAD_FP8_ENV = "DRAMA3_LM_HEAD_FP8"
++BACKBONE_FP8_ENV = "DRAMA3_BACKBONE_FP8"
++BACKBONE_FP8_SCOPE_ENV = "DRAMA3_BACKBONE_FP8_SCOPE"
++# note: these are RUNTIME module suffixes, verified against the installed
++# sglang on the serving node, NOT checkpoint tensor names. The two differ, and
++# selecting on checkpoint names would silently select nothing:
++#   checkpoint q_proj/k_proj/v_proj  -> runtime self_attn.qkv_proj (QKVParallelLinear)
++#   checkpoint in_proj_qkv, in_proj_z -> runtime linear_attn.in_proj_qkvz (merged)
++#   checkpoint in_proj_a, in_proj_b   -> runtime linear_attn.in_proj_ba (merged)
++# Every one of these classes dispatches through self.quant_method.apply in its
++# forward (sglang/srt/layers/linear.py:298, :504, :1654, :1769), which is what
++# makes a timing result interpretable at all.
++BACKBONE_FP8_SUFFIXES = {
++    "attention": (
++        "self_attn.qkv_proj",
++        "self_attn.o_proj",
++    ),
++    "shared_experts": (
++        "mlp.shared_expert.gate_up_proj",
++        "mlp.shared_expert.down_proj",
++    ),
++    "linear_attn": (
++        "linear_attn.in_proj_qkvz",
++        "linear_attn.out_proj",
++    ),
++}
++# Permanently excluded, and deliberately not selectable by any scope:
++#   mlp.gate              the MoE router, 40 MiB, decides which 8 of 256 experts
++#                         run; a small logit shift changes expert selection
++#                         outright. Worst quality risk per byte in the model.
++#   mlp.shared_expert_gate  one row per layer; a gate, same reasoning, no bytes.
++#   linear_attn.in_proj_ba  7.5 MiB total; it produces the GDN decay and gating
++#                         terms rather than a value path, so it carries the
++#                         precision risk of the whole linear_attn family for
++#                         0.4% of its bytes.
++#   linear_attn.conv1d    constructed with quant_config=None upstream, so this
++#                         config is never consulted for it; listed here so the
++#                         next reader does not "fix" its absence.
++logger = logging.getLogger(__name__)
++
++
++def _backbone_fp8_scopes() -> tuple[str, ...]:
++    if os.environ.get(BACKBONE_FP8_ENV, "0") != "1":
++        return ()
++    else:
++        pass
++    raw = os.environ.get(BACKBONE_FP8_SCOPE_ENV, "attention,shared_experts")
++    chosen = tuple(dict.fromkeys(part.strip() for part in raw.split(",")))
++    unknown = [name for name in chosen if name not in BACKBONE_FP8_SUFFIXES]
++    if unknown:
++        raise ValueError(
++            f"Drama 3 backbone FP8: {BACKBONE_FP8_SCOPE_ENV} has unknown scopes "
++            f"{unknown!r}; valid: {list(BACKBONE_FP8_SUFFIXES)}"
++        )
++    else:
++        return chosen
++
++
++def _backbone_fp8_scope(prefix: str, scopes: tuple[str, ...]) -> str | None:
++    # note: match complete module suffixes at a dot boundary. No gate
++    # substring rule: neither mlp.gate nor shared_expert_gate may enter here.
++    for scope in scopes:
++        for suffix in BACKBONE_FP8_SUFFIXES[scope]:
++            if prefix == suffix or prefix.endswith("." + suffix):
++                return scope
++            else:
++                pass
++    return None
++
++
++class _BackboneFp8LinearMethod(Fp8LinearMethod):
++    """Stock FP8 conversion/apply; only preflight and completion accounting added."""
++
++    def __init__(
++        self, owner: ExpertFp8Config, layer: LinearBase, prefix: str, scope: str
++    ) -> None:
++        super().__init__(owner.backbone_fp8_config)
++        if owner._backbone_fp8_validated:
++            raise RuntimeError("Drama 3 backbone FP8: selection changed after preflight")
++        else:
++            pass
++        owner._backbone_fp8_layers[layer] = (prefix, scope)
++        self.owner = owner
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        owner = self.owner
++        # note: the loader builds all modules before postprocessing.
++        # Validate every selected weight before the first stock hook mutates one;
++        # keep byte metadata only, never a bf16 shadow or a conversion pass.
++        if not owner._backbone_fp8_validated:
++            source_bytes = {}
++            for selected, (prefix, _) in owner._backbone_fp8_layers.items():
++                weight = selected.weight
++                if weight.ndim != 2 or weight.dtype != torch.bfloat16:
++                    raise ValueError(
++                        f"Drama 3 backbone FP8: {prefix} needs a 2-D bf16 weight; "
++                        f"got {tuple(weight.shape)} {weight.dtype}"
++                    )
++                else:
++                    source_bytes[selected] = weight.numel() * weight.element_size()
++            owner._backbone_fp8_source_bytes = source_bytes
++            owner._backbone_fp8_validated = True
++        else:
++            pass
++        if layer in owner._backbone_fp8_completed:
++            raise RuntimeError("Drama 3 backbone FP8: repeated postprocessing")
++        else:
++            pass
++        super().process_weights_after_loading(layer)
++        if layer.weight.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
++            raise RuntimeError("Drama 3 backbone FP8: stock hook did not produce E4M3")
++        else:
++            pass
++        owner._backbone_fp8_completed[layer] = (
++            layer.weight.numel() * layer.weight.element_size()
++        )
++        if len(owner._backbone_fp8_completed) == len(owner._backbone_fp8_layers):
++            counts = dict.fromkeys(BACKBONE_FP8_SUFFIXES, 0)
++            source_bytes = dict.fromkeys(BACKBONE_FP8_SUFFIXES, 0)
++            fp8_bytes = dict.fromkeys(BACKBONE_FP8_SUFFIXES, 0)
++            for selected, (_, scope) in owner._backbone_fp8_layers.items():
++                counts[scope] += 1
++                source_bytes[scope] += owner._backbone_fp8_source_bytes[selected]
++                fp8_bytes[scope] += owner._backbone_fp8_completed[selected]
++            logger.info(
++                "Drama 3 backbone FP8: converted layers per scope=%s; "
++                "source_bf16_weight_bytes_per_scope=%s fp8_weight_bytes_per_scope=%s; "
++                "source_bf16_weight_bytes=%d fp8_weight_bytes=%d "
++                "(weights only, excludes scales)",
++                counts,
++                source_bytes,
++                fp8_bytes,
++                sum(owner._backbone_fp8_source_bytes.values()),
++                sum(owner._backbone_fp8_completed.values()),
++            )
++        else:
++            pass
+ 
+ 
+ class ExpertFp8Config(QuantizationConfig):
+-    """Block-FP8 experts; DRAMA3_LM_HEAD_FP8=1 opts the lm_head into online FP8."""
++    """Block-FP8 experts; independently opt in the bf16 head/backbone to FP8."""
+ 
+     def __init__(self) -> None:
++        # note: validate the whole requested scope before building configs
++        # or selecting modules. Scope is ignored when the default-OFF flag is off.
++        backbone_fp8_scopes = _backbone_fp8_scopes()
+         super().__init__()
+         self.expert_fp8_config = Fp8Config(
+             is_checkpoint_fp8_serialized=True,
+@@ -44,6 +184,20 @@
+             if os.environ.get(LM_HEAD_FP8_ENV, "0") == "1"
+             else None
+         )
++        self.backbone_fp8_scopes = backbone_fp8_scopes
++        self.backbone_fp8_config = (
++            Fp8Config(
++                is_checkpoint_fp8_serialized=False,
++                activation_scheme="dynamic",
++                weight_block_size=None,
++            )
++            if backbone_fp8_scopes
++            else None
++        )
++        self._backbone_fp8_layers = {}
++        self._backbone_fp8_source_bytes = {}
++        self._backbone_fp8_completed = {}
++        self._backbone_fp8_validated = False
+ 
+     def get_name(self) -> str:
+         return QUANTIZATION_METHOD
+@@ -95,6 +249,17 @@
+             # ParallelLMHead is not a LinearBase, so Fp8Config.get_quant_method
+             # would not select it. Its logits processor uses this method's apply.
+             return Fp8LinearMethod(self.lm_head_fp8_config)
++        elif (
++            self.backbone_fp8_config is not None
++            and isinstance(layer, LinearBase)
++            and (scope := _backbone_fp8_scope(prefix, self.backbone_fp8_scopes))
++            is not None
++        ):
++            # note: this choice deliberately depends on the module name
++            # as well as the layer type. Keep the MoE router mlp.gate bf16 and
++            # unselectable: its 40 MiB buys little, while a small logit shift can
++            # change which 8 of 256 experts run, the largest quality risk per byte.
++            return _BackboneFp8LinearMethod(self, layer, prefix, scope)
+         elif isinstance(layer, LinearBase):
+             return UnquantizedLinearMethod()
+         else:

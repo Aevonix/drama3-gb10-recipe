@@ -1,0 +1,70 @@
+From: Kurcide <contact@aevonix.com>
+Subject: [PATCH] Opt in to the vendor fused/Triton kernels on an unvalidated GPU
+
+The fused MTP tower and the Triton codebook sampler are gated on exact
+equality with VALIDATED_COMPUTE_CAPABILITY, which upstream sets to (9, 0).
+On any other GPU both silently fall back, logging "untested GPU sm_<cc>".
+
+This makes the gate a per-feature opt-in via DRAMA3_ALLOW_UNTESTED_GPU
+("tower", "sampling", or both). Default is unchanged: nothing is enabled.
+Kept per-feature so a numerical change is attributable to one kernel family.
+
+UNVALIDATED BY THE VENDOR. The gate exists because upstream validated these
+kernels on one compute capability only. Enabling them elsewhere is yours to
+verify; see the README for what we measured and what we did not.
+---
+--- a/sglang_omni/models/fishaudio_drama3/sampling_kernels.py
++++ b/sglang_omni/models/fishaudio_drama3/sampling_kernels.py
+@@ -2,6 +2,7 @@
+ from __future__ import annotations
+ 
+ import dataclasses
++import os
+ 
+ import torch
+ 
+@@ -297,10 +298,23 @@
+     return 1 << (candidate_count.bit_length() - 1)
+ 
+ 
+-def untested_gpu_reason(device: torch.device) -> str | None:
++ALLOW_UNTESTED_GPU_ENV = "DRAMA3_ALLOW_UNTESTED_GPU"
++
++
++def _untested_gpu_allowed(feature: str) -> bool:
++    """Opt a single kernel family onto an unvalidated GPU. Default: nothing."""
++    allowed = os.environ.get(ALLOW_UNTESTED_GPU_ENV, "")
++    return feature in {part.strip() for part in allowed.split(",") if part.strip()}
++
++
++def untested_gpu_reason(
++    device: torch.device, *, feature: str = "sampling"
++) -> str | None:
+     major, minor = torch.cuda.get_device_capability(device)
+     if (major, minor) == VALIDATED_COMPUTE_CAPABILITY:
+         return None
++    elif _untested_gpu_allowed(feature):
++        return None
+     else:
+         return f"untested GPU sm_{major}{minor}"
+ 
+@@ -313,7 +327,7 @@
+         return "Triton is not installed"
+     elif device.type != "cuda" or not current_platform.is_cuda():
+         return f"device {device} is not a CUDA device of the CUDA platform"
+-    elif (gpu_reason := untested_gpu_reason(device)) is not None:
++    elif (gpu_reason := untested_gpu_reason(device, feature="sampling")) is not None:
+         return gpu_reason
+     elif not SELECTED_CANDIDATES <= codebook_size <= MAX_BLOCK_WIDTH:
+         return (
+--- a/sglang_omni/models/fishaudio_drama3/tower_kernels.py
++++ b/sglang_omni/models/fishaudio_drama3/tower_kernels.py
+@@ -220,7 +220,7 @@
+         return "Triton is not installed"
+     elif device.type != "cuda" or not current_platform.is_cuda():
+         return f"device {device} is not a CUDA device of the CUDA platform"
+-    elif (gpu_reason := untested_gpu_reason(device)) is not None:
++    elif (gpu_reason := untested_gpu_reason(device, feature="tower")) is not None:
+         return gpu_reason
+     elif get_exec().deterministic.enable_deterministic_inference:
+         return (
